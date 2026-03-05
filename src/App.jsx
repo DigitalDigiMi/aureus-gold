@@ -54,87 +54,202 @@ function mkSig(pat, entry, t) {
   };
 }
 
-/* ═══ PRICE FEED HOOK ═══ */
-/* Uses Binance direct WebSocket — NO API key needed, CORS-free, hundreds of trades/sec */
-function usePriceFeed() {
+/* ═══ UNIFIED MARKET DATA HOOK ═══ */
+/* Connects to Binance combined stream for live kline + trade data.
+   Also fetches 24h of 5m candles from REST API for history.
+   Falls back to simulated mode if all connections fail. */
+function useMarketData() {
+  const [candles, setCandles] = useState([]);
   const [price, setPrice] = useState(null);
   const [mode, setMode] = useState("connecting");
-  const priceRef = useRef(73000);
-  const simRef = useRef(null);
+  const [closedCandle, setClosedCandle] = useState(null);
   const wsRef = useRef(null);
+  const simRef = useRef(null);
+  const priceRef = useRef(null);
   const throttleRef = useRef(0);
+  const historyLoaded = useRef(false);
+  const lastKlineTime = useRef(0);
 
+  // --- Fetch 24h of real 5m candles from Binance REST ---
+  useEffect(() => {
+    if (historyLoaded.current) return;
+    historyLoaded.current = true;
+
+    fetch("https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=288")
+      .then(r => r.json())
+      .then(data => {
+        if (!Array.isArray(data) || data.length === 0) return;
+        const parsed = data.map(k => ({
+          t: k[0],
+          o: parseFloat(k[1]),
+          h: parseFloat(k[2]),
+          l: parseFloat(k[3]),
+          c: parseFloat(k[4]),
+          v: Math.round(parseFloat(k[5])),
+        }));
+        setCandles(parsed);
+        // set initial price from last candle
+        const lastC = parsed[parsed.length - 1];
+        if (lastC) {
+          priceRef.current = lastC.c;
+          setPrice(lastC.c);
+          lastKlineTime.current = lastC.t;
+        }
+      })
+      .catch(err => {
+        console.log("Binance REST klines failed:", err.message);
+      });
+  }, []);
+
+  // --- Simulated fallback ---
   const startSim = () => {
-    priceRef.current = 73000 + rnd(-500, 500);
-    setPrice(priceRef.current);
+    const base = priceRef.current || (73000 + rnd(-500, 500));
+    priceRef.current = base;
+    setPrice(base);
     setMode("simulated");
     if (simRef.current) clearInterval(simRef.current);
+
+    // Generate 288 simulated historical candles if none loaded
+    if (candles.length === 0) {
+      const sim = [];
+      let p = base;
+      const now = Date.now();
+      for (let i = 287; i >= 1; i--) {
+        const t = floorTo5Min(now) - i * INTERVAL_MS;
+        const o = p;
+        const mv = (Math.random() - 0.48) * p * 0.002;
+        const c = o + mv;
+        const h = Math.max(o, c) + Math.random() * p * 0.001;
+        const l = Math.min(o, c) - Math.random() * p * 0.001;
+        sim.push({ t, o: +o.toFixed(2), h: +h.toFixed(2), l: +l.toFixed(2), c: +c.toFixed(2), v: Math.floor(rnd(50, 500)) });
+        p = c;
+      }
+      // add current slot
+      const slot = floorTo5Min(now);
+      sim.push({ t: slot, o: +p.toFixed(2), h: +p.toFixed(2), l: +p.toFixed(2), c: +p.toFixed(2), v: 1 });
+      setCandles(sim);
+    }
+
     simRef.current = setInterval(() => {
       const mv = (Math.random() - 0.48) * priceRef.current * 0.0004;
       priceRef.current = +(priceRef.current + mv).toFixed(2);
       setPrice(priceRef.current);
+
+      // update last candle
+      const now = Date.now();
+      const slot = floorTo5Min(now);
+      setCandles(prev => {
+        if (prev.length === 0) return prev;
+        const next = [...prev];
+        const last = next[next.length - 1];
+        if (last.t < slot) {
+          setClosedCandle({ ...last, _seq: Date.now() });
+          next.push({ t: slot, o: priceRef.current, h: priceRef.current, l: priceRef.current, c: priceRef.current, v: 1 });
+          while (next.length > 300) next.shift();
+        } else {
+          const u = { ...last };
+          u.c = priceRef.current;
+          u.h = Math.max(u.h, priceRef.current);
+          u.l = Math.min(u.l, priceRef.current);
+          u.v += 1;
+          next[next.length - 1] = u;
+        }
+        return next;
+      });
     }, 1500);
   };
 
+  // --- Binance combined WebSocket: kline_5m + trade ---
   useEffect(() => {
-    return () => {
-      if (simRef.current) clearInterval(simRef.current);
-      if (wsRef.current) { try { wsRef.current.close(); } catch (e) { /* */ } }
-    };
-  }, []);
-
-  useEffect(() => {
-    if (simRef.current) { clearInterval(simRef.current); simRef.current = null; }
-    if (wsRef.current) { try { wsRef.current.close(); } catch (e) { /* */ } wsRef.current = null; }
-
-    setMode("connecting");
     let fallbackTimer = null;
+    let gotData = false;
 
     try {
-      // Binance direct WebSocket — free, no key, CORS-free
-      const ws = new WebSocket("wss://stream.binance.com:9443/ws/btcusdt@trade");
+      // Combined stream: 5m kline data + individual trades
+      const ws = new WebSocket("wss://stream.binance.com:9443/stream?streams=btcusdt@kline_5m/btcusdt@trade");
       wsRef.current = ws;
-      let connected = false;
 
       ws.onopen = () => {
-        // Binance WS auto-streams trades once connected, no subscribe needed
         fallbackTimer = setTimeout(() => {
-          if (!connected) {
+          if (!gotData) {
             try { ws.close(); } catch (e) { /* */ }
             startSim();
           }
-        }, 6000);
+        }, 8000);
       };
 
       ws.onmessage = (e) => {
         try {
-          const d = JSON.parse(e.data);
-          // Binance trade format: { "e":"trade", "p":"73000.50", "s":"BTCUSDT", ... }
-          if (d.e === "trade" && d.p) {
-            connected = true;
+          const msg = JSON.parse(e.data);
+          const d = msg.data || msg;
+
+          // --- Kline stream: complete OHLCV candle updates ---
+          if (d.e === "kline" && d.k) {
+            gotData = true;
             if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+            setMode("live");
+
+            const k = d.k;
+            const kline = {
+              t: k.t,                   // kline start time
+              o: parseFloat(k.o),
+              h: parseFloat(k.h),
+              l: parseFloat(k.l),
+              c: parseFloat(k.c),
+              v: Math.round(parseFloat(k.v)),
+            };
+            const isClosed = k.x; // true when this 5m candle just closed
+
+            setCandles(prev => {
+              if (prev.length === 0) return [kline];
+              const next = [...prev];
+              const lastIdx = next.length - 1;
+
+              if (next[lastIdx].t === kline.t) {
+                // update current candle
+                next[lastIdx] = kline;
+              } else if (kline.t > next[lastIdx].t) {
+                // new candle — previous one closed
+                if (isClosed || next[lastIdx].t < kline.t) {
+                  setClosedCandle({ ...next[lastIdx], _seq: Date.now() });
+                }
+                next.push(kline);
+                while (next.length > 300) next.shift();
+              }
+              return next;
+            });
+
+            // update price from kline close
+            priceRef.current = kline.c;
+            setPrice(kline.c);
+          }
+
+          // --- Trade stream: real-time price ticks ---
+          if (d.e === "trade" && d.p) {
+            gotData = true;
+            if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
+            setMode("live");
+
             const p = parseFloat(d.p);
             if (p > 0) {
-              // Throttle UI updates to ~4/sec (Binance sends hundreds/sec)
               const now = Date.now();
-              if (now - throttleRef.current > 250) {
+              if (now - throttleRef.current > 300) {
                 throttleRef.current = now;
                 priceRef.current = p;
                 setPrice(p);
-                setMode("live");
               }
             }
           }
-        } catch (err) { /* */ }
+        } catch (err) { /* ignore parse errors */ }
       };
 
       ws.onerror = () => {
         if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
-        startSim();
+        if (!gotData) startSim();
       };
 
       ws.onclose = () => {
-        if (!connected) startSim();
+        if (!gotData) startSim();
       };
     } catch (e) {
       startSim();
@@ -142,69 +257,12 @@ function usePriceFeed() {
 
     return () => {
       if (fallbackTimer) clearTimeout(fallbackTimer);
+      if (wsRef.current) { try { wsRef.current.close(); } catch (e) { /* */ } }
+      if (simRef.current) clearInterval(simRef.current);
     };
-  }, []);
+  }, []); // eslint-disable-line
 
-  return { price, mode };
-}
-
-/* ═══ CANDLE BUILDER HOOK ═══ */
-function useCandleBuilder(price) {
-  const [candles, setCandles] = useState([]);
-  const [closedCandle, setClosedCandle] = useState(null);
-  const seeded = useRef(false);
-
-  // seed historical candles once
-  useEffect(() => {
-    if (price === null || seeded.current) return;
-    seeded.current = true;
-    const seed = [];
-    let p = price - rnd(-300, 300);
-    const now = Date.now();
-    for (let i = 59; i >= 1; i--) {
-      const t = floorTo5Min(now) - i * INTERVAL_MS;
-      const o = p;
-      const mv = (Math.random() - 0.48) * p * 0.003;
-      const c = o + mv;
-      const h = Math.max(o, c) + Math.random() * p * 0.0015;
-      const l = Math.min(o, c) - Math.random() * p * 0.0015;
-      seed.push({ t, o: +o.toFixed(2), h: +h.toFixed(2), l: +l.toFixed(2), c: +c.toFixed(2), v: Math.floor(rnd(20, 200)) });
-      p = c;
-    }
-    setCandles(seed);
-  }, [price]);
-
-  // update candles with each tick
-  useEffect(() => {
-    if (price === null || !seeded.current) return;
-    const now = Date.now();
-    const slot = floorTo5Min(now);
-
-    setCandles(prev => {
-      const next = [...prev];
-      const last = next.length > 0 ? next[next.length - 1] : null;
-
-      if (!last || last.t < slot) {
-        // new slot → old candle closed
-        if (last && last.t < slot) {
-          setClosedCandle({ ...last, _seq: Date.now() }); // _seq forces re-trigger
-        }
-        next.push({ t: slot, o: price, h: price, l: price, c: price, v: 1 });
-        while (next.length > 70) next.shift();
-      } else {
-        // update current
-        const c = { ...last };
-        c.c = price;
-        c.h = Math.max(c.h, price);
-        c.l = Math.min(c.l, price);
-        c.v += 1;
-        next[next.length - 1] = c;
-      }
-      return next;
-    });
-  }, [price]);
-
-  return { candles, closedCandle };
+  return { candles, price, mode, closedCandle };
 }
 
 /* ═══ SPARKLINE ═══ */
@@ -465,8 +523,7 @@ function Login({ onLogin }) {
 
 /* ═══ DASHBOARD ═══ */
 function Dashboard({ user, onLogout }) {
-  const { price, mode } = usePriceFeed();
-  const { candles, closedCandle } = useCandleBuilder(price);
+  const { candles, price, mode, closedCandle } = useMarketData();
   const [signals, setSignals] = useState([]);
   const [activeTrades, setActiveTrades] = useState([]);
   const [closedTrades, setClosedTrades] = useState([]);
@@ -506,13 +563,15 @@ function Dashboard({ user, onLogout }) {
     }
   }, [closedCandle]); // eslint-disable-line
 
-  // seed initial signals from historical candles
+  // seed initial signals from historical 24h candles
   useEffect(() => {
-    if (candles.length < 10 || seededSignals.current) return;
+    if (candles.length < 15 || seededSignals.current) return;
     seededSignals.current = true;
     const hist = [];
+    let lastSigIdx = -10; // enforce minimum gap between signals
     for (let i = 5; i < candles.length - 1; i++) {
-      const slice = candles.slice(0, i + 1);
+      if (i - lastSigIdx < 6) continue; // at least 6 candles (30 min) between signals
+      const slice = candles.slice(Math.max(0, i - 20), i + 1); // look at last 20 candles
       const ps = detectPatterns(slice);
       if (ps.length > 0) {
         const sig = mkSig(ps[0], candles[i].c, candles[i].t);
@@ -523,6 +582,7 @@ function Dashboard({ user, onLogout }) {
         const pips = sig.dir === "BUY" ? sig.exit - sig.entry : sig.entry - sig.exit;
         sig.pnl = +(pips * LOT).toFixed(2);
         hist.push(sig);
+        lastSigIdx = i;
       }
     }
     if (hist.length > 0) setSignals(hist.sort((a, b) => b.time - a.time));
@@ -727,7 +787,7 @@ function Dashboard({ user, onLogout }) {
                 </div>
               </div>
               <div ref={boxRef} style={{ width: "100%" }}>
-                {candles.length > 0 && <Chart candles={candles} signals={signals} activeTrades={activeTrades} width={cw - 28} />}
+                {candles.length > 0 && <Chart candles={candles.slice(-100)} signals={signals} activeTrades={activeTrades} width={cw - 28} />}
               </div>
             </div>
 
