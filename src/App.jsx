@@ -18,7 +18,7 @@ const floorTo5Min = (ts) => Math.floor(ts / INTERVAL_MS) * INTERVAL_MS;
 /* ═══ PATTERNS ═══ */
 /* All patterns require meaningful candle bodies (not dojis/noise).
    MIN_BODY = minimum body size as fraction of price (~0.05% of BTC price = ~$36 at $73k) */
-const MIN_BODY_PCT = 0.0005; // 0.05% of price
+const MIN_BODY_PCT = 0.0003; // 0.03% of price (~$22 at BTC $73k)
 
 function bodySize(c) { return Math.abs(c.c - c.o); }
 function isBull(c) { return c.c > c.o; }
@@ -107,8 +107,8 @@ function detectPatterns(cs) {
 }
 
 function mkSig(pat, entry, t) {
-  const sl = +rnd(200, 600).toFixed(0);
-  const tp = +(sl * 3).toFixed(1);
+  const sl = +rnd(80, 250).toFixed(0);  // tighter SL for 5m BTC
+  const tp = +(sl * 1.5).toFixed(0);     // 1:1.5 RR ratio (more achievable)
   const buy = pat.dir === "BUY";
   return {
     id: "s-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
@@ -117,7 +117,7 @@ function mkSig(pat, entry, t) {
     tp: +(buy ? entry + tp : entry - tp).toFixed(2),
     sl: +(buy ? entry - sl : entry + sl).toFixed(2),
     wr: clamp(pat.wr + Math.floor(rnd(-4, 6)), 55, 85),
-    live: true, status: null, exit: null, pnl: null,
+    live: true, status: null, exit: null, pnl: null, source: "auto",
   };
 }
 
@@ -231,8 +231,9 @@ function useMarketData() {
     let fallbackTimer = null;
     let gotData = false;
 
+    const connectWS = () => {
     try {
-      // Combined stream: 5m kline data + individual trades
+      if (wsRef.current) { try { wsRef.current.close(); } catch (e) { /* */ } }
       const ws = new WebSocket("wss://stream.binance.com:9443/stream?streams=btcusdt@kline_5m/btcusdt@trade");
       wsRef.current = ws;
 
@@ -312,15 +313,28 @@ function useMarketData() {
 
       ws.onerror = () => {
         if (fallbackTimer) { clearTimeout(fallbackTimer); fallbackTimer = null; }
-        if (!gotData) startSim();
+        // auto-reconnect after 3s
+        if (gotData) {
+          setTimeout(() => connectWS(), 3000);
+        } else {
+          startSim();
+        }
       };
 
       ws.onclose = () => {
-        if (!gotData) startSim();
+        // auto-reconnect if we had data before (session expired)
+        if (gotData) {
+          setTimeout(() => connectWS(), 3000);
+        } else if (!gotData) {
+          startSim();
+        }
       };
     } catch (e) {
       startSim();
     }
+    }; // end connectWS
+
+    connectWS();
 
     return () => {
       if (fallbackTimer) clearTimeout(fallbackTimer);
@@ -474,7 +488,7 @@ function SC({ sig, onTrade }) {
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 8 }}>
         <div><div style={{ color: T3, fontSize: 8, textTransform: "uppercase", letterSpacing: 0.7 }}>Entry</div><div style={{ color: T1, fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{fp(sig.entry)}</div></div>
-        <div><div style={{ color: T3, fontSize: 8, textTransform: "uppercase", letterSpacing: 0.7 }}>TP (1:3)</div><div style={{ color: GR, fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{fp(sig.tp)}</div></div>
+        <div><div style={{ color: T3, fontSize: 8, textTransform: "uppercase", letterSpacing: 0.7 }}>TP (1:1.5)</div><div style={{ color: GR, fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{fp(sig.tp)}</div></div>
         <div><div style={{ color: T3, fontSize: 8, textTransform: "uppercase", letterSpacing: 0.7 }}>SL</div><div style={{ color: RD, fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{fp(sig.sl)}</div></div>
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -509,6 +523,7 @@ function ATC({ trade, currentPrice, onClose }) {
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <span style={{ padding: "2px 7px", borderRadius: 4, fontSize: 9, fontWeight: 700, background: (buy ? GR : RD) + "15", color: buy ? GR : RD }}>{trade.dir}</span>
           <span style={{ color: T1, fontSize: 11, fontWeight: 600 }}>{trade.pattern}</span>
+          <span style={{ padding: "1px 5px", borderRadius: 3, fontSize: 7, fontWeight: 600, letterSpacing: 0.5, color: trade.source === "auto" ? G : "#8B5CF6", background: (trade.source === "auto" ? G : "#8B5CF6") + "15", border: "1px solid " + (trade.source === "auto" ? G : "#8B5CF6") + "25" }}>{trade.source === "auto" ? "AUTO" : "MANUAL"}</span>
         </div>
         <button onClick={() => onClose(trade)} style={{ background: RD + "15", border: "1px solid " + RD + "30", borderRadius: 5, color: RD, fontSize: 9, padding: "3px 8px", cursor: "pointer", fontFamily: "inherit", fontWeight: 600 }}>CLOSE</button>
       </div>
@@ -588,18 +603,32 @@ function Login({ onLogin }) {
   );
 }
 
+/* ═══ STORAGE HELPERS ═══ */
+function loadJSON(key, fallback) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
+}
+function saveJSON(key, val) {
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch { /* */ }
+}
+
 /* ═══ DASHBOARD ═══ */
 function Dashboard({ user, onLogout }) {
   const { candles, price, mode, closedCandle } = useMarketData();
   const [signals, setSignals] = useState([]);
-  const [activeTrades, setActiveTrades] = useState([]);
-  const [closedTrades, setClosedTrades] = useState([]);
+  const [activeTrades, setActiveTrades] = useState(() => loadJSON("aureus_active", []));
+  const [closedTrades, setClosedTrades] = useState(() => loadJSON("aureus_closed", []));
+  const [autoTrade, setAutoTrade] = useState(() => loadJSON("aureus_auto", true));
   const [modal, setModal] = useState(null);
   const [notes, setNotes] = useState([]);
   const boxRef = useRef(null);
   const [cw, setCw] = useState(700);
   const processedRef = useRef(new Set());
   const seededSignals = useRef(false);
+
+  // persist trades to localStorage
+  useEffect(() => { saveJSON("aureus_active", activeTrades); }, [activeTrades]);
+  useEffect(() => { saveJSON("aureus_closed", closedTrades); }, [closedTrades]);
+  useEffect(() => { saveJSON("aureus_auto", autoTrade); }, [autoTrade]);
 
   // resize
   useEffect(() => {
@@ -625,10 +654,19 @@ function Dashboard({ user, onLogout }) {
     const patterns = detectPatterns(closed);
     for (const p of patterns) {
       const sig = mkSig(p, closedCandle.c, closedCandle.t);
-      setSignals(prev => [sig, ...prev.slice(0, 40)]);
       setNotes(prev => [{ id: Date.now() + Math.random(), text: sig.dir + ": " + sig.pattern + " @ " + fp(sig.entry), dir: sig.dir }, ...prev.slice(0, 2)]);
+
+      if (autoTrade) {
+        // auto-place the trade immediately
+        const trade = { ...sig, live: false, status: null, placedAt: Date.now(), source: "auto" };
+        setActiveTrades(prev => [...prev, trade]);
+        setNotes(prev => [{ id: Date.now() + Math.random(), text: "Auto-trade placed: " + sig.dir + " @ " + fp(sig.entry), dir: sig.dir }, ...prev.slice(0, 2)]);
+      } else {
+        // add as live signal for manual placement
+        setSignals(prev => [sig, ...prev.slice(0, 40)]);
+      }
     }
-  }, [closedCandle]); // eslint-disable-line
+  }, [closedCandle, autoTrade]); // eslint-disable-line
 
   // seed initial signals from historical 24h candles — resolve using REAL price action
   useEffect(() => {
@@ -726,13 +764,14 @@ function Dashboard({ user, onLogout }) {
     return () => clearTimeout(id);
   }, [notes]);
 
-  // place trade: move signal to active trades
+  // place trade: move signal to active trades (manual)
   const placeTrade = (sig) => {
     const trade = {
       ...sig,
       live: false,
-      status: null, // active, not resolved yet
+      status: null,
       placedAt: Date.now(),
+      source: "manual",
     };
     setActiveTrades(prev => [...prev, trade]);
     setSignals(prev => prev.filter(s => s.id !== sig.id));
@@ -912,19 +951,30 @@ function Dashboard({ user, onLogout }) {
 
           {/* right: signals */}
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {/* auto-trade toggle */}
+            <div style={{ background: B2, borderRadius: 11, padding: "10px 12px", border: "1px solid " + (autoTrade ? GR : T3) + "25", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div>
+                <div style={{ color: autoTrade ? GR : T2, fontSize: 11, fontWeight: 700 }}>AUTO-TRADE {autoTrade ? "ON" : "OFF"}</div>
+                <div style={{ color: T3, fontSize: 8, marginTop: 1 }}>{autoTrade ? "Signals auto-placed as trades" : "Manual placement only"}</div>
+              </div>
+              <button onClick={() => setAutoTrade(p => !p)} style={{ padding: "6px 14px", borderRadius: 8, border: "none", background: autoTrade ? GR + "20" : B3, color: autoTrade ? GR : T3, fontSize: 10, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+                {autoTrade ? "DISABLE" : "ENABLE"}
+              </button>
+            </div>
+
             <div style={{ background: B2, borderRadius: 11, padding: 12, border: "1px solid " + G + "18" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
                 <div style={{ width: 7, height: 7, borderRadius: "50%", background: G, animation: "blink 1s infinite" }} />
-                <span style={{ color: G, fontSize: 11, fontWeight: 700, letterSpacing: 1 }}>LIVE SIGNALS</span>
+                <span style={{ color: G, fontSize: 11, fontWeight: 700, letterSpacing: 1 }}>{autoTrade ? "SIGNAL LOG" : "LIVE SIGNALS"}</span>
                 <span style={{ marginLeft: "auto", fontSize: 9, color: T3, padding: "1px 5px", background: B3, borderRadius: 3 }}>{liveSigs.length}</span>
               </div>
-              <p style={{ color: T3, fontSize: 9, marginBottom: 8, lineHeight: 1.4 }}>Signals on 5-min candle close only</p>
+              <p style={{ color: T3, fontSize: 9, marginBottom: 8, lineHeight: 1.4 }}>Signals on 5-min candle close{autoTrade ? " — auto-traded" : ""}</p>
               {liveSigs.length === 0 ? (
                 <div style={{ color: T3, fontSize: 10, textAlign: "center", padding: "14px 0" }}>Waiting for candle close...</div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
                   {liveSigs.slice(0, 4).map(s => (
-                    <SC key={s.id} sig={s} onTrade={setModal} />
+                    <SC key={s.id} sig={s} onTrade={autoTrade ? null : setModal} />
                   ))}
                 </div>
               )}
@@ -934,6 +984,9 @@ function Dashboard({ user, onLogout }) {
               <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 10 }}>
                 <span style={{ color: T2, fontSize: 11, fontWeight: 700, letterSpacing: 1 }}>HISTORY</span>
                 <span style={{ marginLeft: "auto", fontSize: 9, color: T3, padding: "1px 5px", background: B3, borderRadius: 3 }}>{histSigs.length + closedTrades.length}</span>
+                {closedTrades.length > 0 && (
+                  <button onClick={() => { setClosedTrades([]); saveJSON("aureus_closed", []); }} style={{ fontSize: 8, color: T3, background: "transparent", border: "1px solid #2a2d3a", borderRadius: 4, padding: "2px 6px", cursor: "pointer", fontFamily: "inherit" }}>Clear</button>
+                )}
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
                 {closedTrades.slice(0, 5).map(s => (
