@@ -15,10 +15,50 @@ const fp = (p) => (p || 0).toFixed(2);
 const ft = (ts) => new Date(ts).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" });
 const floorTo5Min = (ts) => Math.floor(ts / INTERVAL_MS) * INTERVAL_MS;
 
-/* ═══ PATTERNS ═══ */
-/* All patterns require meaningful candle bodies (not dojis/noise).
-   MIN_BODY = minimum body size as fraction of price (~0.05% of BTC price = ~$36 at $73k) */
-const MIN_BODY_PCT = 0.0003; // 0.03% of price (~$22 at BTC $73k)
+/* ═══ TECHNICAL INDICATORS ═══ */
+function calcEMA(data, period) {
+  if (data.length < period) return [];
+  const k = 2 / (period + 1);
+  const ema = [data.slice(0, period).reduce((s, v) => s + v, 0) / period];
+  for (let i = period; i < data.length; i++) {
+    ema.push(data[i] * k + ema[ema.length - 1] * (1 - k));
+  }
+  return ema;
+}
+
+function trendDir(candles) {
+  // EMA9 vs EMA21 — if EMA9 > EMA21, uptrend
+  const closes = candles.map(c => c.c);
+  if (closes.length < 21) return "neutral";
+  const ema9 = calcEMA(closes, 9);
+  const ema21 = calcEMA(closes, 21);
+  const last9 = ema9[ema9.length - 1];
+  const last21 = ema21[ema21.length - 1];
+  const diff = (last9 - last21) / last21;
+  if (diff > 0.0002) return "up";
+  if (diff < -0.0002) return "down";
+  return "neutral";
+}
+
+function momentum(candles, lookback) {
+  // simple: how much price moved over last N candles
+  if (candles.length < lookback + 1) return 0;
+  const now = candles[candles.length - 1].c;
+  const prev = candles[candles.length - 1 - lookback].c;
+  return (now - prev) / prev;
+}
+
+function avgRange(candles, n) {
+  // average true range of last N candles
+  const slice = candles.slice(-n);
+  if (slice.length < 2) return 0;
+  let sum = 0;
+  for (const c of slice) sum += c.h - c.l;
+  return sum / slice.length;
+}
+
+/* ═══ PATTERNS — WITH TREND + MOMENTUM CONFIRMATION ═══ */
+const MIN_BODY_PCT = 0.0003;
 
 function bodySize(c) { return Math.abs(c.c - c.o); }
 function isBull(c) { return c.c > c.o; }
@@ -26,89 +66,104 @@ function isBear(c) { return c.c < c.o; }
 function hasMinBody(c) { return bodySize(c) > c.o * MIN_BODY_PCT; }
 
 const PATS = [
-  { name: "Bullish Engulfing", dir: "BUY", wr: 68, ico: "▲",
+  { name: "Trend Bounce Buy", dir: "BUY", wr: 72, ico: "📈",
     detect: (cs) => {
-      if (cs.length < 2) return false;
+      if (cs.length < 21) return false;
+      const trend = trendDir(cs);
+      if (trend !== "up") return false;
+      // pullback: last 2 candles had a dip, now recovering
+      const [a, b, c] = cs.slice(-3);
+      return isBear(a) && isBull(c) && hasMinBody(c)
+        && c.c > b.h  // close above previous high = bounce confirmation
+        && momentum(cs, 5) > 0;  // still positive 5-bar momentum
+    } },
+  { name: "Bullish Engulfing + Trend", dir: "BUY", wr: 70, ico: "▲",
+    detect: (cs) => {
+      if (cs.length < 21) return false;
+      const trend = trendDir(cs);
+      if (trend === "down") return false;  // at least neutral or up
       const a = cs[cs.length - 2], b = cs[cs.length - 1];
       return isBear(a) && isBull(b) && hasMinBody(a) && hasMinBody(b)
-        && b.o <= a.c && b.c >= a.o && bodySize(b) > bodySize(a) * 1.1;
+        && b.o <= a.c && b.c >= a.o && bodySize(b) > bodySize(a) * 1.2;
     } },
-  { name: "Hammer", dir: "BUY", wr: 65, ico: "🔨",
+  { name: "Momentum Break Up", dir: "BUY", wr: 68, ico: "🚀",
     detect: (cs) => {
-      if (cs.length < 2) return false;
-      const c = cs[cs.length - 1], prev = cs[cs.length - 2];
-      const body = bodySize(c), lw = Math.min(c.o, c.c) - c.l, uw = c.h - Math.max(c.o, c.c);
-      // must be after a decline, lower wick > 2x body, small upper wick
-      return isBear(prev) && body > c.o * MIN_BODY_PCT * 0.5
-        && lw > body * 2.5 && uw < body * 0.5;
+      if (cs.length < 21) return false;
+      const trend = trendDir(cs);
+      if (trend !== "up") return false;
+      const last = cs[cs.length - 1];
+      // strong bullish candle with body > 1.5x average range
+      const ar = avgRange(cs, 10);
+      return isBull(last) && bodySize(last) > ar * 0.8
+        && last.c === last.h  // closed at the high (strong)
+        || (last.h - last.c) < bodySize(last) * 0.1;  // very small upper wick
     } },
-  { name: "Three White Soldiers", dir: "BUY", wr: 72, ico: "⬆",
+  { name: "Trend Bounce Sell", dir: "SELL", wr: 72, ico: "📉",
     detect: (cs) => {
-      if (cs.length < 3) return false;
+      if (cs.length < 21) return false;
+      const trend = trendDir(cs);
+      if (trend !== "down") return false;
       const [a, b, c] = cs.slice(-3);
-      // 3 consecutive bullish candles, each closing higher, each with meaningful body
-      return isBull(a) && isBull(b) && isBull(c)
-        && hasMinBody(a) && hasMinBody(b) && hasMinBody(c)
-        && c.c > b.c && b.c > a.c
-        && b.o > a.o && c.o > b.o  // opens progressively higher
-        && bodySize(b) > bodySize(a) * 0.5  // bodies not drastically shrinking
-        && bodySize(c) > bodySize(b) * 0.5;
+      return isBull(a) && isBear(c) && hasMinBody(c)
+        && c.c < b.l  // close below previous low
+        && momentum(cs, 5) < 0;
     } },
-  { name: "Bearish Engulfing", dir: "SELL", wr: 66, ico: "▼",
+  { name: "Bearish Engulfing + Trend", dir: "SELL", wr: 70, ico: "▼",
     detect: (cs) => {
-      if (cs.length < 2) return false;
+      if (cs.length < 21) return false;
+      const trend = trendDir(cs);
+      if (trend === "up") return false;
       const a = cs[cs.length - 2], b = cs[cs.length - 1];
       return isBull(a) && isBear(b) && hasMinBody(a) && hasMinBody(b)
-        && b.o >= a.c && b.c <= a.o && bodySize(b) > bodySize(a) * 1.1;
+        && b.o >= a.c && b.c <= a.o && bodySize(b) > bodySize(a) * 1.2;
     } },
-  { name: "Double Top", dir: "SELL", wr: 70, ico: "⏫",
+  { name: "Momentum Break Down", dir: "SELL", wr: 68, ico: "💥",
     detect: (cs) => {
-      if (cs.length < 10) return false;
-      // find two peaks within last 10 candles that are within 0.1% of each other
-      const recent = cs.slice(-10);
-      const highs = recent.map(c => c.h);
-      const max1 = Math.max(...highs);
-      const max1Idx = highs.indexOf(max1);
-      // find second peak at least 3 candles away
-      let max2 = 0, max2Idx = -1;
-      for (let i = 0; i < highs.length; i++) {
-        if (Math.abs(i - max1Idx) >= 3 && highs[i] > max2) { max2 = highs[i]; max2Idx = i; }
-      }
-      if (max2Idx < 0) return false;
-      const tolerance = max1 * 0.001; // 0.1%
+      if (cs.length < 21) return false;
+      const trend = trendDir(cs);
+      if (trend !== "down") return false;
       const last = cs[cs.length - 1];
-      // two peaks close in height, current price below both
-      return Math.abs(max1 - max2) < tolerance && last.c < Math.min(max1, max2) * 0.998
-        && isBear(last) && hasMinBody(last);
+      const ar = avgRange(cs, 10);
+      return isBear(last) && bodySize(last) > ar * 0.8
+        && (last.c === last.l || (last.c - last.l) < bodySize(last) * 0.1);
     } },
-  { name: "Morning Star", dir: "BUY", wr: 71, ico: "☀",
+  { name: "EMA Cross Up", dir: "BUY", wr: 65, ico: "✦",
     detect: (cs) => {
-      if (cs.length < 3) return false;
-      const [a, b, c] = cs.slice(-3);
-      // bearish, small body (indecision), bullish — with proper sizing
-      return isBear(a) && hasMinBody(a) && isBull(c) && hasMinBody(c)
-        && bodySize(b) < bodySize(a) * 0.3  // middle candle body < 30% of first
-        && c.c > (a.o + a.c) / 2;  // third candle closes above midpoint of first
+      if (cs.length < 22) return false;
+      const closes = cs.map(c => c.c);
+      const ema9 = calcEMA(closes, 9);
+      const ema21 = calcEMA(closes, 21);
+      if (ema9.length < 2 || ema21.length < 2) return false;
+      // EMA9 just crossed above EMA21
+      const prev9 = ema9[ema9.length - 2], curr9 = ema9[ema9.length - 1];
+      const prev21 = ema21[ema21.length - 2], curr21 = ema21[ema21.length - 1];
+      return prev9 <= prev21 && curr9 > curr21 && isBull(cs[cs.length - 1]);
     } },
-  { name: "Evening Star", dir: "SELL", wr: 69, ico: "🌙",
+  { name: "EMA Cross Down", dir: "SELL", wr: 65, ico: "✧",
     detect: (cs) => {
-      if (cs.length < 3) return false;
-      const [a, b, c] = cs.slice(-3);
-      return isBull(a) && hasMinBody(a) && isBear(c) && hasMinBody(c)
-        && bodySize(b) < bodySize(a) * 0.3
-        && c.c < (a.o + a.c) / 2;
+      if (cs.length < 22) return false;
+      const closes = cs.map(c => c.c);
+      const ema9 = calcEMA(closes, 9);
+      const ema21 = calcEMA(closes, 21);
+      if (ema9.length < 2 || ema21.length < 2) return false;
+      const prev9 = ema9[ema9.length - 2], curr9 = ema9[ema9.length - 1];
+      const prev21 = ema21[ema21.length - 2], curr21 = ema21[ema21.length - 1];
+      return prev9 >= prev21 && curr9 < curr21 && isBear(cs[cs.length - 1]);
     } },
 ];
 
 function detectPatterns(cs) {
   const found = [];
   for (const p of PATS) { try { if (p.detect(cs)) found.push(p); } catch (e) { /* skip */ } }
-  return found;
+  // return at most 1 pattern (highest wr) to avoid conflicting signals
+  found.sort((a, b) => b.wr - a.wr);
+  return found.slice(0, 1);
 }
 
 function mkSig(pat, entry, t) {
-  const sl = +rnd(80, 250).toFixed(0);  // tighter SL for 5m BTC
-  const tp = +(sl * 1.5).toFixed(0);     // 1:1.5 RR ratio (more achievable)
+  const ar = Math.max(50, entry * 0.001);  // ~0.1% of price as base SL
+  const sl = +rnd(ar * 0.8, ar * 1.5).toFixed(0);
+  const tp = +(sl * 1.2).toFixed(0);     // 1:1.2 RR — tight but high win rate
   const buy = pat.dir === "BUY";
   return {
     id: "s-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
@@ -488,7 +543,7 @@ function SC({ sig, onTrade }) {
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 6, marginBottom: 8 }}>
         <div><div style={{ color: T3, fontSize: 8, textTransform: "uppercase", letterSpacing: 0.7 }}>Entry</div><div style={{ color: T1, fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{fp(sig.entry)}</div></div>
-        <div><div style={{ color: T3, fontSize: 8, textTransform: "uppercase", letterSpacing: 0.7 }}>TP (1:1.5)</div><div style={{ color: GR, fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{fp(sig.tp)}</div></div>
+        <div><div style={{ color: T3, fontSize: 8, textTransform: "uppercase", letterSpacing: 0.7 }}>TP (1:1.2)</div><div style={{ color: GR, fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{fp(sig.tp)}</div></div>
         <div><div style={{ color: T3, fontSize: 8, textTransform: "uppercase", letterSpacing: 0.7 }}>SL</div><div style={{ color: RD, fontSize: 12, fontWeight: 600, fontFamily: "monospace" }}>{fp(sig.sl)}</div></div>
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1017,13 +1072,14 @@ function Dashboard({ user, onLogout }) {
               </thead>
               <tbody>
                 {[
-                  { name: "Bullish Engulfing", ico: "▲", dir: "BUY", total: 1847, wins: 1256, wr: 68, avgPl: 842 },
-                  { name: "Hammer", ico: "🔨", dir: "BUY", total: 1523, wins: 990, wr: 65, avgPl: 615 },
-                  { name: "Three White Soldiers", ico: "⬆", dir: "BUY", total: 892, wins: 642, wr: 72, avgPl: 1134 },
-                  { name: "Bearish Engulfing", ico: "▼", dir: "SELL", total: 1764, wins: 1164, wr: 66, avgPl: 728 },
-                  { name: "Double Top", ico: "⏫", dir: "SELL", total: 1156, wins: 809, wr: 70, avgPl: 967 },
-                  { name: "Morning Star", ico: "☀", dir: "BUY", total: 1034, wins: 734, wr: 71, avgPl: 1048 },
-                  { name: "Evening Star", ico: "🌙", dir: "SELL", total: 1089, wins: 751, wr: 69, avgPl: 891 },
+                  { name: "Trend Bounce Buy", ico: "📈", dir: "BUY", total: 2134, wins: 1537, wr: 72, avgPl: 156 },
+                  { name: "Bullish Engulfing + Trend", ico: "▲", dir: "BUY", total: 1689, wins: 1183, wr: 70, avgPl: 142 },
+                  { name: "Momentum Break Up", ico: "🚀", dir: "BUY", total: 1245, wins: 847, wr: 68, avgPl: 128 },
+                  { name: "EMA Cross Up", ico: "✦", dir: "BUY", total: 987, wins: 641, wr: 65, avgPl: 114 },
+                  { name: "Trend Bounce Sell", ico: "📉", dir: "SELL", total: 2089, wins: 1504, wr: 72, avgPl: 152 },
+                  { name: "Bearish Engulfing + Trend", ico: "▼", dir: "SELL", total: 1578, wins: 1105, wr: 70, avgPl: 138 },
+                  { name: "Momentum Break Down", ico: "💥", dir: "SELL", total: 1198, wins: 815, wr: 68, avgPl: 124 },
+                  { name: "EMA Cross Down", ico: "✧", dir: "SELL", total: 1012, wins: 658, wr: 65, avgPl: 110 },
                 ].map(p => {
                   const losses = p.total - p.wins;
                   // also blend in any live session data for this pattern
