@@ -16,21 +16,88 @@ const ft = (ts) => new Date(ts).toLocaleTimeString("en-US", { hour: "2-digit", m
 const floorTo5Min = (ts) => Math.floor(ts / INTERVAL_MS) * INTERVAL_MS;
 
 /* ═══ PATTERNS ═══ */
+/* All patterns require meaningful candle bodies (not dojis/noise).
+   MIN_BODY = minimum body size as fraction of price (~0.05% of BTC price = ~$36 at $73k) */
+const MIN_BODY_PCT = 0.0005; // 0.05% of price
+
+function bodySize(c) { return Math.abs(c.c - c.o); }
+function isBull(c) { return c.c > c.o; }
+function isBear(c) { return c.c < c.o; }
+function hasMinBody(c) { return bodySize(c) > c.o * MIN_BODY_PCT; }
+
 const PATS = [
   { name: "Bullish Engulfing", dir: "BUY", wr: 68, ico: "▲",
-    detect: (cs) => { const a = cs[cs.length - 2], b = cs[cs.length - 1]; return cs.length >= 2 && a.c < a.o && b.c > b.o && b.c > a.o && b.o < a.c; } },
+    detect: (cs) => {
+      if (cs.length < 2) return false;
+      const a = cs[cs.length - 2], b = cs[cs.length - 1];
+      return isBear(a) && isBull(b) && hasMinBody(a) && hasMinBody(b)
+        && b.o <= a.c && b.c >= a.o && bodySize(b) > bodySize(a) * 1.1;
+    } },
   { name: "Hammer", dir: "BUY", wr: 65, ico: "🔨",
-    detect: (cs) => { const c = cs[cs.length - 1], body = Math.abs(c.c - c.o), lw = Math.min(c.o, c.c) - c.l; return body > 0 && lw > body * 2 && (c.h - Math.max(c.o, c.c)) < body * 0.3; } },
+    detect: (cs) => {
+      if (cs.length < 2) return false;
+      const c = cs[cs.length - 1], prev = cs[cs.length - 2];
+      const body = bodySize(c), lw = Math.min(c.o, c.c) - c.l, uw = c.h - Math.max(c.o, c.c);
+      // must be after a decline, lower wick > 2x body, small upper wick
+      return isBear(prev) && body > c.o * MIN_BODY_PCT * 0.5
+        && lw > body * 2.5 && uw < body * 0.5;
+    } },
   { name: "Three White Soldiers", dir: "BUY", wr: 72, ico: "⬆",
-    detect: (cs) => cs.length >= 3 && cs.slice(-3).every(c => c.c > c.o) && cs[cs.length - 1].c > cs[cs.length - 2].c && cs[cs.length - 2].c > cs[cs.length - 3].c },
+    detect: (cs) => {
+      if (cs.length < 3) return false;
+      const [a, b, c] = cs.slice(-3);
+      // 3 consecutive bullish candles, each closing higher, each with meaningful body
+      return isBull(a) && isBull(b) && isBull(c)
+        && hasMinBody(a) && hasMinBody(b) && hasMinBody(c)
+        && c.c > b.c && b.c > a.c
+        && b.o > a.o && c.o > b.o  // opens progressively higher
+        && bodySize(b) > bodySize(a) * 0.5  // bodies not drastically shrinking
+        && bodySize(c) > bodySize(b) * 0.5;
+    } },
   { name: "Bearish Engulfing", dir: "SELL", wr: 66, ico: "▼",
-    detect: (cs) => { const a = cs[cs.length - 2], b = cs[cs.length - 1]; return cs.length >= 2 && a.c > a.o && b.c < b.o && b.o > a.c && b.c < a.o; } },
+    detect: (cs) => {
+      if (cs.length < 2) return false;
+      const a = cs[cs.length - 2], b = cs[cs.length - 1];
+      return isBull(a) && isBear(b) && hasMinBody(a) && hasMinBody(b)
+        && b.o >= a.c && b.c <= a.o && bodySize(b) > bodySize(a) * 1.1;
+    } },
   { name: "Double Top", dir: "SELL", wr: 70, ico: "⏫",
-    detect: (cs) => cs.length >= 5 && Math.abs(cs[cs.length - 1].h - cs[cs.length - 3].h) < cs[cs.length - 1].h * 0.001 && cs[cs.length - 1].c < cs[cs.length - 2].c },
+    detect: (cs) => {
+      if (cs.length < 10) return false;
+      // find two peaks within last 10 candles that are within 0.1% of each other
+      const recent = cs.slice(-10);
+      const highs = recent.map(c => c.h);
+      const max1 = Math.max(...highs);
+      const max1Idx = highs.indexOf(max1);
+      // find second peak at least 3 candles away
+      let max2 = 0, max2Idx = -1;
+      for (let i = 0; i < highs.length; i++) {
+        if (Math.abs(i - max1Idx) >= 3 && highs[i] > max2) { max2 = highs[i]; max2Idx = i; }
+      }
+      if (max2Idx < 0) return false;
+      const tolerance = max1 * 0.001; // 0.1%
+      const last = cs[cs.length - 1];
+      // two peaks close in height, current price below both
+      return Math.abs(max1 - max2) < tolerance && last.c < Math.min(max1, max2) * 0.998
+        && isBear(last) && hasMinBody(last);
+    } },
   { name: "Morning Star", dir: "BUY", wr: 71, ico: "☀",
-    detect: (cs) => { if (cs.length < 3) return false; const [a, b, c] = cs.slice(-3); return a.c < a.o && Math.abs(b.c - b.o) < (a.o - a.c) * 0.3 && c.c > c.o; } },
+    detect: (cs) => {
+      if (cs.length < 3) return false;
+      const [a, b, c] = cs.slice(-3);
+      // bearish, small body (indecision), bullish — with proper sizing
+      return isBear(a) && hasMinBody(a) && isBull(c) && hasMinBody(c)
+        && bodySize(b) < bodySize(a) * 0.3  // middle candle body < 30% of first
+        && c.c > (a.o + a.c) / 2;  // third candle closes above midpoint of first
+    } },
   { name: "Evening Star", dir: "SELL", wr: 69, ico: "🌙",
-    detect: (cs) => { if (cs.length < 3) return false; const [a, b, c] = cs.slice(-3); return a.c > a.o && Math.abs(b.c - b.o) < (a.c - a.o) * 0.3 && c.c < c.o; } },
+    detect: (cs) => {
+      if (cs.length < 3) return false;
+      const [a, b, c] = cs.slice(-3);
+      return isBull(a) && hasMinBody(a) && isBear(c) && hasMinBody(c)
+        && bodySize(b) < bodySize(a) * 0.3
+        && c.c < (a.o + a.c) / 2;
+    } },
 ];
 
 function detectPatterns(cs) {
@@ -563,28 +630,64 @@ function Dashboard({ user, onLogout }) {
     }
   }, [closedCandle]); // eslint-disable-line
 
-  // seed initial signals from historical 24h candles
+  // seed initial signals from historical 24h candles — resolve using REAL price action
   useEffect(() => {
     if (candles.length < 15 || seededSignals.current) return;
     seededSignals.current = true;
     const hist = [];
-    let lastSigIdx = -10; // enforce minimum gap between signals
-    for (let i = 5; i < candles.length - 1; i++) {
-      if (i - lastSigIdx < 6) continue; // at least 6 candles (30 min) between signals
-      const slice = candles.slice(Math.max(0, i - 20), i + 1); // look at last 20 candles
+    let lastSigIdx = -10;
+
+    for (let i = 5; i < candles.length - 2; i++) {
+      if (i - lastSigIdx < 6) continue;
+      const slice = candles.slice(Math.max(0, i - 20), i + 1);
       const ps = detectPatterns(slice);
-      if (ps.length > 0) {
-        const sig = mkSig(ps[0], candles[i].c, candles[i].t);
-        const won = Math.random() * 100 < sig.wr;
-        sig.live = false;
-        sig.status = won ? "WIN" : "LOSS";
-        sig.exit = won ? sig.tp : sig.sl;
-        const pips = sig.dir === "BUY" ? sig.exit - sig.entry : sig.entry - sig.exit;
-        sig.pnl = +(pips * LOT).toFixed(2);
+      if (ps.length === 0) continue;
+
+      const sig = mkSig(ps[0], candles[i].c, candles[i].t);
+      const isBuy = sig.dir === "BUY";
+
+      // walk forward through subsequent candles to see if TP or SL was hit
+      let resolved = false;
+      for (let j = i + 1; j < candles.length; j++) {
+        const fwd = candles[j];
+        const tpHit = isBuy ? fwd.h >= sig.tp : fwd.l <= sig.tp;
+        const slHit = isBuy ? fwd.l <= sig.sl : fwd.h >= sig.sl;
+
+        if (tpHit && slHit) {
+          // both hit in same candle — assume SL hit first if open was moving against
+          const openFavors = isBuy ? fwd.o < fwd.c : fwd.o > fwd.c;
+          if (openFavors) {
+            sig.status = "WIN"; sig.exit = sig.tp;
+          } else {
+            sig.status = "LOSS"; sig.exit = sig.sl;
+          }
+          resolved = true;
+        } else if (tpHit) {
+          sig.status = "WIN"; sig.exit = sig.tp; resolved = true;
+        } else if (slHit) {
+          sig.status = "LOSS"; sig.exit = sig.sl; resolved = true;
+        }
+
+        if (resolved) {
+          sig.live = false;
+          const pips = isBuy ? sig.exit - sig.entry : sig.entry - sig.exit;
+          sig.pnl = +(pips * LOT).toFixed(2);
+          hist.push(sig);
+          lastSigIdx = i;
+          break;
+        }
+      }
+
+      // if not resolved (neither TP nor SL hit in remaining candles), mark as pending/open
+      if (!resolved) {
+        // still open — show as live signal (most recent ones)
+        sig.live = true;
+        sig.status = null;
         hist.push(sig);
         lastSigIdx = i;
       }
     }
+
     if (hist.length > 0) setSignals(hist.sort((a, b) => b.time - a.time));
   }, [candles.length]); // eslint-disable-line
 
